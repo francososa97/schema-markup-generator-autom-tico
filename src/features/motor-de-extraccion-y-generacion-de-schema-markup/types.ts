@@ -63,7 +63,8 @@ export class CrawlerError extends Error {
     | 'UNREACHABLE'
     | 'HTTP_ERROR'
     | 'TIMEOUT'
-    | 'RENDER_FAILED';
+    | 'RENDER_FAILED'
+    | 'BLOCKED_HOST';
 
   constructor(
     code: CrawlerError['code'],

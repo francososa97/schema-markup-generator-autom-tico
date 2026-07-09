@@ -1,6 +1,8 @@
 import * as cheerio from 'cheerio';
 import type { CheerioAPI } from 'cheerio';
 import { chromium, type Browser } from 'playwright';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import {
   CrawlerError,
   type CrawlerOptions,
@@ -16,6 +18,8 @@ const DEFAULT_USER_AGENT =
 // Por debajo de este volumen de texto asumimos que el contenido
 // se renderiza vía JS y conviene reintentar con Playwright.
 const DEFAULT_JS_CONTENT_THRESHOLD = 200;
+const MAX_REDIRECTS = 5;
+const BLOCKED_HOSTNAMES = new Set(['localhost', 'metadata.google.internal']);
 
 /**
  * Crawler que dado un URL público devuelve HTML + metadata + contenido principal.
@@ -37,7 +41,7 @@ export class CrawlerService {
   /** Punto de entrada principal: escanea un URL público. */
   public async scan(rawUrl: string): Promise<PageScanResult> {
     const startedAt = Date.now();
-    const url = this.validateUrl(rawUrl);
+    const url = await this.validateUrl(rawUrl);
 
     // 1) Intento estático con fetch + Cheerio.
     const staticHtml = await this.fetchStatic(url, this.timeoutMs);
@@ -56,13 +60,23 @@ export class CrawlerService {
     }
 
     // 3) Fallback a Playwright dentro del presupuesto restante.
+    // Nota: a diferencia de fetchStatic, acá no se revalida cada redirect
+    // (Playwright no expone un hook simple para eso sin route interception).
+    // El target inicial ya pasó validateUrl; si se necesita blindar también
+    // la cadena de redirects en el path renderizado, agregar interceptor de
+    // request en `context` que llame a isPrivateOrReservedIp por cada navegación.
     const renderedHtml = await this.fetchRendered(url, remainingMs);
     const $rendered = cheerio.load(renderedHtml);
     return this.buildResult(url, renderedHtml, $rendered, 'playwright', startedAt);
   }
 
-  /** Valida y normaliza el URL; sólo http/https son aceptados. */
-  private validateUrl(rawUrl: string): URL {
+  /**
+   * Valida y normaliza el URL; sólo http/https son aceptados, y se
+   * bloquean hosts/IPs internos o reservados para evitar SSRF (incluye
+   * resolución DNS real, no solo el hostname literal, para mitigar
+   * DNS rebinding).
+   */
+  private async validateUrl(rawUrl: string): Promise<URL> {
     let parsed: URL;
     try {
       parsed = new URL(rawUrl);
@@ -75,22 +89,109 @@ export class CrawlerService {
         `Protocolo no soportado: "${parsed.protocol}". Usar http o https.`,
       );
     }
+    await this.assertHostAllowed(parsed.hostname);
     return parsed;
   }
 
-  /** Descarga HTML estático con fetch nativo y un AbortController por timeout. */
+  /** Lanza CrawlerError si el hostname (o la IP a la que resuelve) es interno/reservado. */
+  private async assertHostAllowed(hostname: string): Promise<void> {
+    const lower = hostname.toLowerCase();
+    if (BLOCKED_HOSTNAMES.has(lower) || lower.endsWith('.localhost')) {
+      throw new CrawlerError('BLOCKED_HOST', `Host no permitido: "${hostname}"`);
+    }
+
+    let ip: string;
+    if (isIP(hostname)) {
+      ip = hostname;
+    } else {
+      try {
+        ip = (await lookup(hostname)).address;
+      } catch {
+        throw new CrawlerError('UNREACHABLE', `No se pudo resolver el host: "${hostname}"`);
+      }
+    }
+
+    if (this.isPrivateOrReservedIp(ip)) {
+      throw new CrawlerError(
+        'BLOCKED_HOST',
+        `Host no permitido: "${hostname}" resuelve a una IP interna/reservada (${ip})`,
+      );
+    }
+  }
+
+  /** true si la IP (v4 o v6) es loopback, privada, link-local o reservada (incl. metadata de cloud). */
+  private isPrivateOrReservedIp(ip: string): boolean {
+    const version = isIP(ip);
+    if (version === 4) {
+      const parts = ip.split('.').map(Number);
+      const [a, b] = parts;
+      if (a === 127) return true; // loopback
+      if (a === 10) return true; // 10.0.0.0/8
+      if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+      if (a === 192 && b === 168) return true; // 192.168.0.0/16
+      if (a === 169 && b === 254) return true; // link-local, incluye metadata 169.254.169.254
+      if (a === 0) return true; // 0.0.0.0/8
+      return false;
+    }
+    if (version === 6) {
+      const lower = ip.toLowerCase();
+      if (lower === '::1' || lower === '::') return true; // loopback / unspecified
+      if (lower.startsWith('fe80:')) return true; // link-local
+      if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // unique local (fc00::/7)
+      if (lower.startsWith('::ffff:')) {
+        // IPv4-mapped IPv6: revalidar como v4
+        const mapped = lower.slice('::ffff:'.length);
+        return isIP(mapped) === 4 ? this.isPrivateOrReservedIp(mapped) : true;
+      }
+      return false;
+    }
+    return true; // IP no reconocible: bloquear por las dudas
+  }
+
+  /** Descarga HTML estático con fetch nativo, siguiendo redirects a mano (cada hop se revalida). */
   private async fetchStatic(url: URL, budgetMs: number): Promise<string> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), budgetMs);
-    try {
-      const response = await fetch(url.toString(), {
-        redirect: 'follow',
-        signal: controller.signal,
-        headers: {
-          'user-agent': this.userAgent,
-          accept: 'text/html,application/xhtml+xml',
-        },
-      });
+    let currentUrl = url;
+    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), budgetMs);
+      let response: Response;
+      try {
+        response = await fetch(currentUrl.toString(), {
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: {
+            'user-agent': this.userAgent,
+            accept: 'text/html,application/xhtml+xml',
+          },
+        });
+      } catch (error: unknown) {
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new CrawlerError('TIMEOUT', `Timeout de ${budgetMs}ms al descargar el HTML`);
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new CrawlerError('UNREACHABLE', `URL inaccesible: ${detail}`);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        if (location === null) {
+          throw new CrawlerError('UNREACHABLE', `Redirect ${response.status} sin header Location`);
+        }
+        const nextUrl = this.resolveUrl(location, currentUrl);
+        if (nextUrl === null) {
+          throw new CrawlerError('UNREACHABLE', `Location de redirect inválida: "${location}"`);
+        }
+        const parsedNext = new URL(nextUrl);
+        if (parsedNext.protocol !== 'http:' && parsedNext.protocol !== 'https:') {
+          throw new CrawlerError('BLOCKED_HOST', `Redirect a protocolo no soportado: "${parsedNext.protocol}"`);
+        }
+        await this.assertHostAllowed(parsedNext.hostname);
+        currentUrl = parsedNext;
+        continue;
+      }
+
       if (!response.ok) {
         throw new CrawlerError(
           'HTTP_ERROR',
@@ -98,21 +199,8 @@ export class CrawlerService {
         );
       }
       return await response.text();
-    } catch (error: unknown) {
-      if (error instanceof CrawlerError) {
-        throw error;
-      }
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new CrawlerError(
-          'TIMEOUT',
-          `Timeout de ${budgetMs}ms al descargar el HTML`,
-        );
-      }
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new CrawlerError('UNREACHABLE', `URL inaccesible: ${detail}`);
-    } finally {
-      clearTimeout(timer);
     }
+    throw new CrawlerError('UNREACHABLE', `Demasiados redirects (>${MAX_REDIRECTS})`);
   }
 
   /** Renderiza la página con Playwright (Chromium headless). */
