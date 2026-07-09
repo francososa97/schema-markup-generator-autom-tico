@@ -3,6 +3,8 @@ import type { CheerioAPI } from 'cheerio';
 import { chromium, type Browser } from 'playwright';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import {
   CrawlerError,
   type CrawlerOptions,
@@ -11,6 +13,12 @@ import {
   type PageScanResult,
   type RenderStrategy,
 } from './types';
+
+interface PinnedResponse {
+  readonly statusCode: number;
+  readonly headers: Record<string, string | string[] | undefined>;
+  readonly body: string;
+}
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_USER_AGENT =
@@ -41,10 +49,10 @@ export class CrawlerService {
   /** Punto de entrada principal: escanea un URL público. */
   public async scan(rawUrl: string): Promise<PageScanResult> {
     const startedAt = Date.now();
-    const url = await this.validateUrl(rawUrl);
+    const { url, ip } = await this.validateUrl(rawUrl);
 
     // 1) Intento estático con fetch + Cheerio.
-    const staticHtml = await this.fetchStatic(url, this.timeoutMs);
+    const staticHtml = await this.fetchStatic(url, ip, this.timeoutMs);
     const $static = cheerio.load(staticHtml);
     const staticContent = this.extractMainContent($static);
 
@@ -72,11 +80,13 @@ export class CrawlerService {
 
   /**
    * Valida y normaliza el URL; sólo http/https son aceptados, y se
-   * bloquean hosts/IPs internos o reservados para evitar SSRF (incluye
-   * resolución DNS real, no solo el hostname literal, para mitigar
-   * DNS rebinding).
+   * bloquean hosts/IPs internos o reservados para evitar SSRF. Devuelve
+   * también la IP ya resuelta y validada, para que el fetch posterior se
+   * conecte exactamente a esa IP (ver `fetchStatic`/`requestPinned`) en vez
+   * de dejar que Node vuelva a resolver DNS por su cuenta — eso es lo que
+   * cierra la ventana de DNS rebinding (TOCTOU entre validar y conectar).
    */
-  private async validateUrl(rawUrl: string): Promise<URL> {
+  private async validateUrl(rawUrl: string): Promise<{ url: URL; ip: string }> {
     let parsed: URL;
     try {
       parsed = new URL(rawUrl);
@@ -89,12 +99,16 @@ export class CrawlerService {
         `Protocolo no soportado: "${parsed.protocol}". Usar http o https.`,
       );
     }
-    await this.assertHostAllowed(parsed.hostname);
-    return parsed;
+    const ip = await this.assertHostAllowed(parsed.hostname);
+    return { url: parsed, ip };
   }
 
-  /** Lanza CrawlerError si el hostname (o la IP a la que resuelve) es interno/reservado. */
-  private async assertHostAllowed(hostname: string): Promise<void> {
+  /**
+   * Lanza CrawlerError si el hostname (o la IP a la que resuelve) es
+   * interno/reservado; si pasa la validación, devuelve la IP resuelta para
+   * que el caller la reutilice (pinning) en vez de resolver DNS de nuevo.
+   */
+  private async assertHostAllowed(hostname: string): Promise<string> {
     const lower = hostname.toLowerCase();
     if (BLOCKED_HOSTNAMES.has(lower) || lower.endsWith('.localhost')) {
       throw new CrawlerError('BLOCKED_HOST', `Host no permitido: "${hostname}"`);
@@ -117,6 +131,7 @@ export class CrawlerService {
         `Host no permitido: "${hostname}" resuelve a una IP interna/reservada (${ip})`,
       );
     }
+    return ip;
   }
 
   /** true si la IP (v4 o v6) es loopback, privada, link-local o reservada (incl. metadata de cloud). */
@@ -131,6 +146,7 @@ export class CrawlerService {
       if (a === 192 && b === 168) return true; // 192.168.0.0/16
       if (a === 169 && b === 254) return true; // link-local, incluye metadata 169.254.169.254
       if (a === 0) return true; // 0.0.0.0/8
+      if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
       return false;
     }
     if (version === 6) {
@@ -148,36 +164,39 @@ export class CrawlerService {
     return true; // IP no reconocible: bloquear por las dudas
   }
 
-  /** Descarga HTML estático con fetch nativo, siguiendo redirects a mano (cada hop se revalida). */
-  private async fetchStatic(url: URL, budgetMs: number): Promise<string> {
+  /**
+   * Descarga HTML estático siguiendo redirects a mano (cada hop se revalida
+   * y se conecta a la IP ya validada, no a la que Node resuelva de nuevo).
+   * El presupuesto de tiempo es agregado: se descuenta lo ya gastado en
+   * cada hop en vez de reiniciar el timeout completo por redirect.
+   */
+  private async fetchStatic(url: URL, ip: string, budgetMs: number): Promise<string> {
+    const deadline = Date.now() + budgetMs;
     let currentUrl = url;
+    let currentIp = ip;
+
     for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), budgetMs);
-      let response: Response;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new CrawlerError('TIMEOUT', `Timeout de ${budgetMs}ms al descargar el HTML`);
+      }
+
+      let response: PinnedResponse;
       try {
-        response = await fetch(currentUrl.toString(), {
-          redirect: 'manual',
-          signal: controller.signal,
-          headers: {
-            'user-agent': this.userAgent,
-            accept: 'text/html,application/xhtml+xml',
-          },
-        });
+        response = await this.requestPinned(currentUrl, currentIp, remaining);
       } catch (error: unknown) {
-        if (error instanceof Error && error.name === 'AbortError') {
+        if (error instanceof Error && error.message === 'TIMEOUT') {
           throw new CrawlerError('TIMEOUT', `Timeout de ${budgetMs}ms al descargar el HTML`);
         }
         const detail = error instanceof Error ? error.message : String(error);
         throw new CrawlerError('UNREACHABLE', `URL inaccesible: ${detail}`);
-      } finally {
-        clearTimeout(timer);
       }
 
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get('location');
-        if (location === null) {
-          throw new CrawlerError('UNREACHABLE', `Redirect ${response.status} sin header Location`);
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        const rawLocation = response.headers.location;
+        const location = Array.isArray(rawLocation) ? rawLocation[0] : rawLocation;
+        if (location === undefined) {
+          throw new CrawlerError('UNREACHABLE', `Redirect ${response.statusCode} sin header Location`);
         }
         const nextUrl = this.resolveUrl(location, currentUrl);
         if (nextUrl === null) {
@@ -187,20 +206,78 @@ export class CrawlerService {
         if (parsedNext.protocol !== 'http:' && parsedNext.protocol !== 'https:') {
           throw new CrawlerError('BLOCKED_HOST', `Redirect a protocolo no soportado: "${parsedNext.protocol}"`);
         }
-        await this.assertHostAllowed(parsedNext.hostname);
+        currentIp = await this.assertHostAllowed(parsedNext.hostname);
         currentUrl = parsedNext;
         continue;
       }
 
-      if (!response.ok) {
-        throw new CrawlerError(
-          'HTTP_ERROR',
-          `El servidor respondió ${response.status} ${response.statusText}`,
-        );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw new CrawlerError('HTTP_ERROR', `El servidor respondió ${response.statusCode}`);
       }
-      return await response.text();
+      return response.body;
     }
     throw new CrawlerError('UNREACHABLE', `Demasiados redirects (>${MAX_REDIRECTS})`);
+  }
+
+  /**
+   * Hace un GET conectándose directamente a `pinnedIp` (vía una función
+   * `lookup` custom que ignora cualquier resolución DNS nueva), preservando
+   * el hostname real en el header Host y en `servername` para que TLS/SNI
+   * sigan validando contra el dominio original. Esto es lo que cierra la
+   * ventana de TOCTOU/DNS rebinding entre `assertHostAllowed` y la conexión.
+   */
+  private requestPinned(url: URL, pinnedIp: string, budgetMs: number): Promise<PinnedResponse> {
+    return new Promise((resolve, reject) => {
+      const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest;
+      const req = requestFn(
+        url,
+        {
+          method: 'GET',
+          timeout: budgetMs,
+          headers: {
+            'user-agent': this.userAgent,
+            accept: 'text/html,application/xhtml+xml',
+            host: url.host,
+          },
+          // Node invoca este lookup con distinta forma de callback según
+          // `options.all` (algunos paths internos lo piden en array); hay
+          // que soportar ambas o el request falla con "Invalid IP address".
+          lookup: (
+            _hostname: string,
+            options: { all?: boolean } | ((err: NodeJS.ErrnoException | null, address: string, family: number) => void),
+            callback?: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+          ) => {
+            const family = isIP(pinnedIp) === 6 ? 6 : 4;
+            const actualCallback = typeof options === 'function' ? options : callback;
+            const wantsAll = typeof options === 'object' && options !== null && options.all === true;
+            if (wantsAll) {
+              (actualCallback as unknown as (err: null, addrs: { address: string; family: number }[]) => void)(
+                null,
+                [{ address: pinnedIp, family }],
+              );
+            } else {
+              actualCallback?.(null, pinnedIp, family);
+            }
+          },
+          ...(url.protocol === 'https:' ? { servername: url.hostname } : {}),
+        },
+        (res: IncomingMessage) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => {
+            resolve({
+              statusCode: res.statusCode ?? 0,
+              headers: res.headers,
+              body: Buffer.concat(chunks).toString('utf8'),
+            });
+          });
+          res.on('error', reject);
+        },
+      );
+      req.on('timeout', () => req.destroy(new Error('TIMEOUT')));
+      req.on('error', reject);
+      req.end();
+    });
   }
 
   /** Renderiza la página con Playwright (Chromium headless). */
