@@ -27,7 +27,22 @@ const DEFAULT_USER_AGENT =
 // se renderiza vía JS y conviene reintentar con Playwright.
 const DEFAULT_JS_CONTENT_THRESHOLD = 200;
 const MAX_REDIRECTS = 5;
+const MAX_BODY_BYTES = 5 * 1024 * 1024; // 5 MB — evita OOM con respuestas enormes/maliciosas.
 const BLOCKED_HOSTNAMES = new Set(['localhost', 'metadata.google.internal']);
+// Content-Type aceptados para parsear como HTML; todo lo demás (imágenes,
+// PDFs, binarios) se rechaza en vez de decodificarse como texto a ciegas.
+const ALLOWED_CONTENT_TYPE_PATTERN = /^(text\/|application\/xhtml\+xml)/i;
+// Charsets declarados que Node puede decodificar de forma nativa sin
+// dependencias nuevas; cualquier otro cae a utf-8 (mejor esfuerzo).
+const CHARSET_TO_NODE_ENCODING: Record<string, BufferEncoding> = {
+  'utf-8': 'utf8',
+  utf8: 'utf8',
+  'us-ascii': 'ascii',
+  ascii: 'ascii',
+  'iso-8859-1': 'latin1',
+  latin1: 'latin1',
+  'windows-1252': 'latin1',
+};
 
 /**
  * Crawler que dado un URL público devuelve HTML + metadata + contenido principal.
@@ -188,6 +203,12 @@ export class CrawlerService {
         if (error instanceof Error && error.message === 'TIMEOUT') {
           throw new CrawlerError('TIMEOUT', `Timeout de ${budgetMs}ms al descargar el HTML`);
         }
+        if (error instanceof Error && error.message === 'BODY_TOO_LARGE') {
+          throw new CrawlerError(
+            'BODY_TOO_LARGE',
+            `La respuesta supera el límite de ${MAX_BODY_BYTES} bytes`,
+          );
+        }
         const detail = error instanceof Error ? error.message : String(error);
         throw new CrawlerError('UNREACHABLE', `URL inaccesible: ${detail}`);
       }
@@ -214,6 +235,16 @@ export class CrawlerService {
       if (response.statusCode < 200 || response.statusCode >= 300) {
         throw new CrawlerError('HTTP_ERROR', `El servidor respondió ${response.statusCode}`);
       }
+
+      const rawContentType = response.headers['content-type'];
+      const contentType = Array.isArray(rawContentType) ? rawContentType[0] : rawContentType;
+      if (contentType !== undefined && !ALLOWED_CONTENT_TYPE_PATTERN.test(contentType)) {
+        throw new CrawlerError(
+          'UNSUPPORTED_CONTENT_TYPE',
+          `Content-Type no soportado para scan de página: "${contentType}"`,
+        );
+      }
+
       return response.body;
     }
     throw new CrawlerError('UNREACHABLE', `Demasiados redirects (>${MAX_REDIRECTS})`);
@@ -263,15 +294,31 @@ export class CrawlerService {
         },
         (res: IncomingMessage) => {
           const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          let totalBytes = 0;
+          let stopped = false;
+
+          res.on('data', (chunk: Buffer) => {
+            if (stopped) return;
+            totalBytes += chunk.length;
+            if (totalBytes > MAX_BODY_BYTES) {
+              stopped = true;
+              res.destroy();
+              reject(new Error('BODY_TOO_LARGE'));
+              return;
+            }
+            chunks.push(chunk);
+          });
           res.on('end', () => {
+            if (stopped) return;
             resolve({
               statusCode: res.statusCode ?? 0,
               headers: res.headers,
-              body: Buffer.concat(chunks).toString('utf8'),
+              body: Buffer.concat(chunks).toString(this.encodingFromContentType(res.headers['content-type'])),
             });
           });
-          res.on('error', reject);
+          res.on('error', (err) => {
+            if (!stopped) reject(err);
+          });
         },
       );
       req.on('timeout', () => req.destroy(new Error('TIMEOUT')));
@@ -280,19 +327,48 @@ export class CrawlerService {
     });
   }
 
-  /** Renderiza la página con Playwright (Chromium headless). */
+  /**
+   * Decide con qué encoding decodificar el body según el charset declarado
+   * en Content-Type (mejor esfuerzo, sin dependencias nuevas: Node solo trae
+   * unas pocas codificaciones nativas — ver `CHARSET_TO_NODE_ENCODING`).
+   */
+  private encodingFromContentType(contentType: string | undefined): BufferEncoding {
+    if (contentType === undefined) return 'utf8';
+    const match = /charset=([^;]+)/i.exec(contentType);
+    if (match === null) return 'utf8';
+    const charset = match[1].trim().toLowerCase();
+    return CHARSET_TO_NODE_ENCODING[charset] ?? 'utf8';
+  }
+
+  /**
+   * Renderiza la página con Playwright (Chromium headless). El tiempo que
+   * tarda `chromium.launch()` (puede ser 1-3s de cold start) se descuenta
+   * del presupuesto antes de navegar, para que el total siga respetando
+   * `budgetMs` en vez de sumarse por fuera del timeout de `page.goto`.
+   */
   private async fetchRendered(url: URL, budgetMs: number): Promise<string> {
+    const startedAt = Date.now();
     let browser: Browser | null = null;
     try {
       browser = await chromium.launch({ headless: true });
+      const remaining = budgetMs - (Date.now() - startedAt);
+      if (remaining <= 0) {
+        throw new CrawlerError(
+          'TIMEOUT',
+          `Timeout de ${budgetMs}ms: chromium.launch() agotó el presupuesto`,
+        );
+      }
       const context = await browser.newContext({ userAgent: this.userAgent });
       const page = await context.newPage();
       await page.goto(url.toString(), {
         waitUntil: 'networkidle',
-        timeout: budgetMs,
+        timeout: remaining,
       });
       return await page.content();
     } catch (error: unknown) {
+      if (error instanceof CrawlerError) {
+        throw error;
+      }
       const detail = error instanceof Error ? error.message : String(error);
       if (detail.toLowerCase().includes('timeout')) {
         throw new CrawlerError(

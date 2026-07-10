@@ -64,7 +64,9 @@ export class CrawlerError extends Error {
     | 'HTTP_ERROR'
     | 'TIMEOUT'
     | 'RENDER_FAILED'
-    | 'BLOCKED_HOST';
+    | 'BLOCKED_HOST'
+    | 'BODY_TOO_LARGE'
+    | 'UNSUPPORTED_CONTENT_TYPE';
 
   constructor(
     code: CrawlerError['code'],
